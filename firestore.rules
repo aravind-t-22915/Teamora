@@ -1,0 +1,218 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    // Is the request from a signed-in user?
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    // Get the caller's user doc
+    function getUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Is the caller an active member of the given club?
+    function isMember(clubId) {
+      let u = getUser();
+      return isAuth() && u.clubId == clubId && u.status == 'active';
+    }
+
+    // Is the caller a coach or assistant_coach for the club?
+    function isCoach(clubId) {
+      let u = getUser();
+      return isMember(clubId) && u.role in ['coach', 'assistant_coach'];
+    }
+
+    // Is the caller specifically the head coach (admin)?
+    function isHeadCoach(clubId) {
+      let u = getUser();
+      return isMember(clubId) && u.role == 'coach';
+    }
+
+    // Is the caller a manager of the club?
+    function isManager(clubId) {
+      let u = getUser();
+      return isMember(clubId) && u.role in ['coach', 'assistant_coach', 'manager'];
+    }
+
+    // Is this the caller's own document?
+    function isOwn(userId) {
+      return isAuth() && request.auth.uid == userId;
+    }
+
+    // ─── Users ───────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      // Anyone authenticated can read users in their own club (needed for squad list)
+      allow read: if isAuth() && (
+        isOwn(userId) ||
+        resource.data.clubId == getUser().clubId
+      );
+
+      // User can create their own profile on registration
+      allow create: if isOwn(userId);
+
+      // User can update their own profile; coaches can update anyone in their club
+      allow update: if isOwn(userId) ||
+        isManager(resource.data.clubId);
+
+      // Only head coach can delete (kick) a member
+      allow delete: if isHeadCoach(resource.data.clubId);
+    }
+
+    // ─── Clubs ───────────────────────────────────────────────────────────────
+    match /clubs/{clubId} {
+      // Any authenticated user can read a club (needed for join flow)
+      allow read: if isAuth();
+
+      // Only authenticated users can create a club (on registration)
+      allow create: if isAuth();
+
+      // Only head coach can update club details
+      allow update: if isHeadCoach(clubId);
+
+      // Nobody can delete a club from the app
+      allow delete: if false;
+    }
+
+    // ─── Events ──────────────────────────────────────────────────────────────
+    match /events/{eventId} {
+      // Any active club member can read events for their club
+      allow read: if isMember(resource.data.clubId);
+
+      // Coaches and assistant coaches can create events
+      allow create: if isCoach(request.resource.data.clubId);
+
+      // Coaches can edit/delete events
+      allow update, delete: if isCoach(resource.data.clubId);
+    }
+
+    // ─── Attendance ──────────────────────────────────────────────────────────
+    match /attendance/{attendanceId} {
+      // Members can read attendance for their club's events
+      allow read: if isMember(resource.data.clubId);
+
+      // Members can create/update their own attendance record
+      allow create: if isAuth() &&
+        request.resource.data.userId == request.auth.uid &&
+        isMember(request.resource.data.clubId);
+
+      allow update: if isOwn(resource.data.userId) ||
+        isCoach(resource.data.clubId);
+
+      allow delete: if isOwn(resource.data.userId) ||
+        isCoach(resource.data.clubId);
+    }
+
+    // ─── Gallery ─────────────────────────────────────────────────────────────
+    match /gallery/{mediaId} {
+      // Active members can view gallery
+      allow read: if isMember(resource.data.clubId);
+
+      // Any active member can upload (coaches + players)
+      allow create: if isMember(request.resource.data.clubId) &&
+        request.resource.data.uploadedBy == request.auth.uid;
+
+      // Uploader or coach can delete
+      allow delete: if isOwn(resource.data.uploadedBy) ||
+        isCoach(resource.data.clubId);
+
+      // Only uploader can edit caption/details
+      allow update: if isOwn(resource.data.uploadedBy) ||
+        isCoach(resource.data.clubId);
+    }
+
+    // ─── Match Results ───────────────────────────────────────────────────────
+    match /matchResults/{resultId} {
+      allow read: if isMember(resource.data.clubId);
+      allow create, update: if isCoach(request.resource.data.clubId);
+      allow delete: if isHeadCoach(resource.data.clubId);
+    }
+
+    // ─── Polls ───────────────────────────────────────────────────────────────
+    match /polls/{pollId} {
+      allow read: if isMember(resource.data.clubId);
+      allow create: if isCoach(request.resource.data.clubId);
+      allow update: if isMember(resource.data.clubId); // members can vote
+      allow delete: if isCoach(resource.data.clubId);
+    }
+
+    match /pollResponses/{responseId} {
+      allow read: if isMember(resource.data.clubId);
+      allow create: if isAuth() &&
+        request.resource.data.userId == request.auth.uid &&
+        isMember(request.resource.data.clubId);
+      allow update: if isOwn(resource.data.userId);
+      allow delete: if isOwn(resource.data.userId) ||
+        isCoach(resource.data.clubId);
+    }
+
+    // ─── Notifications ────────────────────────────────────────────────────────
+    match /notifications/{notificationId} {
+      // Members can read their own notifications
+      allow read: if isMember(resource.data.clubId) &&
+        (request.auth.uid in resource.data.targetUserIds ||
+         resource.data.targetUserIds.size() == 0);
+
+      // Only coaches/managers can create notifications
+      allow create: if isManager(request.resource.data.clubId);
+
+      // Members can mark as read (update readBy array)
+      allow update: if isMember(resource.data.clubId);
+
+      allow delete: if isManager(resource.data.clubId);
+    }
+
+    // ─── Groups ──────────────────────────────────────────────────────────────
+    match /groups/{groupId} {
+      allow read: if isMember(resource.data.clubId);
+      allow create, update, delete: if isManager(
+        resource == null ? request.resource.data.clubId : resource.data.clubId
+      );
+    }
+
+    // ─── Match Data (lineup, timeline, ratings) ──────────────────────────────
+    match /matchData/{matchId} {
+      allow read: if isMember(resource.data.clubId);
+      allow create: if isCoach(request.resource.data.clubId);
+      allow update: if isCoach(resource.data.clubId);
+      allow delete: if isHeadCoach(resource.data.clubId);
+    }
+
+    // ─── Match Results ────────────────────────────────────────────────────────
+    match /matchResults/{resultId} {
+      allow read: if isMember(resource.data.clubId);
+      allow create: if isCoach(request.resource.data.clubId);
+      allow update: if isCoach(resource.data.clubId);
+      allow delete: if isHeadCoach(resource.data.clubId);
+    }
+
+    // ─── Player Stats ─────────────────────────────────────────────────────────
+    match /playerStats/{statsId} {
+      // Active members can read stats for their own club
+      allow read: if isAuth() && (
+        resource.data.userId == request.auth.uid ||
+        isMember(resource.data.clubId)
+      );
+      // Only coaches write stats (updated programmatically after results)
+      allow create, update: if isCoach(request.resource.data.clubId);
+      allow delete: if isHeadCoach(resource.data.clubId);
+    }
+
+    // ─── Reports ─────────────────────────────────────────────────────────────
+    match /reports/{reportId} {
+      allow read: if isMember(resource.data.clubId);
+      allow create, update: if isCoach(request.resource.data.clubId);
+      allow delete: if isHeadCoach(resource.data.clubId);
+    }
+
+    // ─── Club Settings ────────────────────────────────────────────────────────
+    match /clubSettings/{clubId} {
+      allow read: if isMember(clubId);
+      allow write: if isHeadCoach(clubId);
+    }
+  }
+}
